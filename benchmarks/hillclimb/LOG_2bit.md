@@ -2930,3 +2930,179 @@ effect on the arm nq=100 MT cell, direction consistent with H39 and H48,
 worth a proper soak by anyone who wants to spend one.
 
 **Verdict: non-win 25/25.**
+
+---
+
+# Round 2 — reopened 2026-09-06 at main 1.0.0 (ccab9f32)
+
+Round 1 closed at 25 consecutive non-wins on 2026-08-08 and shipped as #511
+(five wins, 8-cell HM x1.0495). Main has since moved: format v7 (#535/#536),
+five release-blocking fixes (#533), and a whole-block prune on the aarch64
+nq=1 block-parallel path (#493) that touches an objective cell directly. The
+round-1 baseline is therefore stale and is re-pinned at this HEAD before
+anything is measured. Same eight cells, same harness, same authority
+(`whm_2bit.py`), non-win count restarts at 0/20 per `GOAL_2bit.md`.
+
+Branch `perf/2bit-hillclimb-2`, worktree `~/git/tv-2bit-hc`.
+
+**Protocol carried over from round 1, stated up front this time:**
+
+- Control run first. P34/P35 found the smoke's no-op band is per-cell —
+  0.2% `nq1_st`, 1.4% `nq1_mt`, 1.1% `nq100_st`, 0.1% `nq100_mt` on arm —
+  and that a wide band means mode-switching, not sampling. A byte-identical
+  binary is run A/B against itself on both boxes before the first candidate.
+- Rebuild the box to baseline after every candidate (round-1 correction 2).
+- `rm -rf target` before every release build; LD_PRELOAD the arch libopenblas.
+- Prebuilt `.so` files per label, balanced ABBA passes, min per label.
+
+**Opening candidates, in order:**
+
+1. H51 — `TILES_PER_THREAD_NEON` 64 -> 32, the one candidate round 1 left
+   open (H50: `nq100_mt` x1.0033 at 3.3x band, never soaked).
+2. The #493 prune on the arm nq=1 path: it was added for a gate-crossing
+   case at nq=1 and measured neutral in H116 at the old geometry; re-measure
+   at the 2-bit cells, since it sits on `nq1_st` and `nq1_mt` directly.
+3. Width-invariant constants — the round-1 lesson (H14, H41): any constant
+   swept at 4 bits and inherited at 2 is a candidate. `FLUSH_EVERY` is done;
+   the remaining ones are catalogued before the first build.
+
+## Rig status
+
+Blocked at open: gcloud's auth token expired, and both boxes are reached
+through an IAP tunnel (`ProxyCommand gcloud compute start-iap-tunnel`), so
+`ssh tvarm` / `ssh tvx86` fail until `gcloud auth login` is re-run
+interactively. Local (M3 Max) is not an objective cell and is used only to
+check that the harness still runs against the v7 build.
+
+## Local pre-screen calibration (M3 Max, not an objective cell)
+
+While the rig is down, the laptop is used to screen aarch64 candidates. Its
+no-op band, byte-identical binary ABBA, min of 3 sub-runs per pass:
+
+| cell | ctl | ctl2 | band |
+|---|---|---|---|
+| nq100_mt | 9.843 | 9.595 | **2.6%** |
+| nq1_mt | 0.317 | 0.327 | **2.8%** |
+| nq100_st | 98.433 | 98.547 | 0.1% |
+| nq1_st | 1.195 | 1.196 | 0.05% |
+
+The MT cells are unresolvable here below ~3% (E-cores and scheduler jitter);
+the ST cells resolve at 0.1%. So the laptop can screen ST-path candidates and
+cannot screen MT-only ones. Nothing measured here is a verdict — verdicts
+come from the two boxes through `whm_2bit.py`.
+
+## H51 — `TILES_PER_THREAD_NEON` 64 -> 32 (round-1 H50) — local pre-screen UNRESOLVED
+
+2-pass ABBA, min per label: nq100_mt x1.0073, nq1_mt x0.9885, nq100_st
+x1.0002, nq1_st x1.0068. Both MT cells sit inside the 2.6-2.8% local band;
+both ST cells are untouched by construction (ST has one range). Consistent
+with round 1's +0.33% on the Axion box and no more informative than that.
+**Queued for the rig soak; no verdict.**
+
+## H52 — the #493 whole-block prune on the arm nq=1 path, ablated — REFUTED as a lever (local pre-screen)
+
+Main added a whole-block prune to `scan_range_neon`'s lane loop after round 1
+closed (#493), on a cell this climb scores directly. Round 1's H116 had
+measured the same prune neutral at 4 bits. Ablated with `if false &&` at the
+prune's guard so the block-max tree compiles out; binaries differ
+(`5fc546dd` vs `1fad8892`). ST-only ABBA on the laptop, where the ST band is
+0.1%:
+
+| cell | ctl | prune off | |
+|---|---|---|---|
+| nq1_st | 1.173 | 1.269 | **x0.924** |
+| nq100_st | 98.341 | 98.409 | x0.999 (untouched path) |
+
+**The prune is worth 7.6% at 2 bits on this cell**, not the "neutral" H116
+recorded at 4 bits — at half the bytes per vector the lane loop is a larger
+share of the block, so skipping it matters more. It is already in the
+baseline, so there is nothing to win here; the value is knowing the lever is
+live at 2 bits and pointing the same direction as the arm nq=1 gap.
+**Not a candidate; not counted.** (Ablations and probes that do not propose a
+change are recorded but do not consume the non-win count, per round 1's
+convention for P-entries.)
+
+## H53 — const-generic batch width for the x86 2-bit VNNI kernel — PRE-REGISTERED
+
+Found by reading the shipped machine code rather than the source.
+`search_multi_query_vnni` takes `nq` at runtime and loops
+`for qi in 0..nq.min(8)` over `acc: [[__m512i; 2]; 8]` and
+`split_luts[qi]`. LLVM unrolls that loop to 8, but it cannot delete the
+trip-count test or the slice bounds check, so the shipped inner body per
+quad-half is:
+
+```
+vpermb (%rdx,%rcx,1),%zmm17,%zmm18
+vpdpbusd %zmm20,%zmm18,%zmm1
+vpermb 0x40(%rdx,%rcx,1),%zmm16,%zmm18
+vpdpbusd %zmm20,%zmm18,%zmm1
+cmp $0x1,%r8 ; je ...        <- nq.min(8) exit test
+cmp $0x1,%rdi ; je ...       <- split_luts.len() bounds check
+... x8 queries ...
+vmovdqa64 %zmm6,0x280(%rsp)  <- accumulators for queries 5-8 spilled per quad
+```
+
+Per quad at nq=8 that is 32 vpermb + 32 vpdpbusd (the work) plus 32
+compare-and-branch pairs and ~8 zmm stores (the overhead). On Sapphire
+Rapids vpermb is p5-only and vpdpbusd zmm is p0-only, so the work alone is
+32 cycles a quad on each port; the fused branches land on p0/p6 and the
+stores on p4/p9, so the overhead is not free and sits on the same critical
+port as the dot products. P7 priced the shipped ST cell 17% under the P6
+probe — a probe whose loop had a constant width — and attributed the gap to
+"probe idealization". This is a concrete candidate for part of that gap.
+
+Change: `NQ` becomes a const generic; the dispatch picks `<4>` for a tail
+of <= 4 queries and `<8>` otherwise (the driver already pads `split_luts`
+to the batch width). LUT pointers, scales and biases are copied into
+`[_; NQ]` locals up front so every hot-loop access is a constant index.
+Accumulation order per query is unchanged, so scores are bit-identical.
+Pad queries in a narrow tail are scored into registers and skipped at the
+heap update.
+
+Prediction: x86 nq100_st and nq100_mt improve; nq=1 untouched (separate
+kernel); arm untouched by construction. `cargo check --target
+x86_64-unknown-linux-gnu` clean. Patch staged as `~/hc/h53.patch` on the
+x86 box, to run after the baseline pin.
+
+## Round-2 baseline — commit ccab9f32 (main 1.0.0), pinned 2026-09-06
+
+Both boxes: `git reset --hard ccab9f32`, `rm -rf target`, `maturin develop
+--release` (51 crates compiled — a clean build, verified), old `.tvim`
+caches deleted so the seeded index is rebuilt in the v7 format, arch
+libopenblas LD_PRELOADed, one process per cell. Three rounds of
+`cells_2bit.py` (each cell min of 9 sub-runs); the pin is the per-cell min
+across rounds. Files: `data/r2_base_{arm,x86}.json` (with all raw samples),
+rounds in `data/r2_base_{arm,x86}_r{1,2,3}.json`.
+
+| cell | arm ms | arm round spread | x86 ms | x86 round spread |
+|---|---|---|---|---|
+| nq1_st | **1.650** | 2.6% | **1.533** | 24.2% |
+| nq1_mt | **0.263** | 5.5% | **0.427** | 4.2% |
+| nq100_st | **134.453** | 4.3% | **85.802** | 1.3% |
+| nq100_mt | **17.217** | 0.7% | **24.013** | 2.8% |
+
+Against the round-1 pin (262793f) every arm cell is faster (nq1_st 1.995
+-> 1.650, nq100_st 148.99 -> 134.45, nq100_mt 18.43 -> 17.22): that is the
+five round-1 wins plus #493's prune, as expected. x86 nq100_st 83.1 -> 85.8
+and nq100_mt 25.5 -> 24.0 are inside their bands of the H41 capstone. **x86
+nq1_st is bimodal across processes again** — rounds read 1.533 / 1.903 /
+1.90 with min-of-9 inside each — so that cell's pin is the fast mode and a
+candidate must reach the fast mode to tie it. The x86 nq=1 control smoke
+below shows the same 9% band on an unchanged binary.
+
+**Control bands (byte-identical `base2.so` vs `ctl2.so`, 2-pass ABBA smoke,
+min per label):**
+
+| cell | arm | x86 |
+|---|---|---|
+| nq100_st | 0.6% | 0.2% |
+| nq100_mt | 0.6% | 0.4% |
+| nq1_st | 0.2% | **8.8%** |
+| nq1_mt | 1.9% | 0.7% |
+
+Parity digests (2-bit / 4-bit) recorded in `data/r2_parity_{arm,x86}.json`;
+the 2-bit digests differ between arches, as they did in round 1 (the x86
+VNNI kernel rounds once at the end, the arm classic kernel flushes), and the
+gate is per-arch against these.
+
+Non-win count: 0/20.
