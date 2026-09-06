@@ -4554,3 +4554,37 @@ N=200k x1.01 ST / x1.02 MT). Nothing in the arm changes (H67's LUT
 build, H68's early exit) is specific to nq=13, and the instrument's
 no-op floor on this box (P4) has 13-23 of 88 points past 3%. Re-measured
 in isolation (P44, six ABBA passes) rather than argued away.
+
+## H81 / H82 / H84 / H85 — constant sweeps — all REFUTED (non-wins 7, 8, 9, 10 / 20)
+
+Two ABBA rounds each vs `h69`:
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H81 x86 `TILES_PER_THREAD` 32->16 | nq100_mt | 15.93-16.17 | 15.98-16.64 | x0.997 (min) / x0.986 (mean) — worse |
+| H82 x86 nq=1 prefetch 8->16 quads | nq1_st | 1.29-1.31 (+1 outlier) | 1.29-1.38 | x1.00 on mins; unresolved |
+| | nq1_mt | 0.415-0.422 | 0.409-0.446 | x1.015 min / x0.972 mean — noise |
+| H84 arm `TILES_PER_THREAD_NEON` 64->96 | nq100_mt | 17.28-17.41 | 17.19-17.47 | x1.005 / x1.002 — inside band |
+| | nq1_mt | 0.274-0.280 | 0.274-0.283 | flat |
+| H85 arm 2-bit tile floor x2 -> x1 | nq100_mt | 17.28-17.41 | 17.71-17.80 | **x0.976** — H14's floor still right |
+
+Every round-1 constant re-asked at the round-2 geometry answers the
+same way it did. **Verdicts: non-wins 7-10 of 20.**
+
+## H86 — VNNI batch width 4 at MT — PRE-REGISTERED (x86)
+
+P36 chose width 6 on the ST cell, where one thread owns the 48 KB L1D
+and the 36 KB LUT set fits. At MT the harness runs 8 workers on 4
+cores, so two hyperthreads share each L1D: two 36 KB sets do not fit
+where two 24 KB sets (width 4) do. Mechanism is the same L1 term that
+made 10 lose (H55); the prediction is a few percent on nq100_mt and
+nothing at ST. `VNNI_BATCH` becomes 4 when the pool has more than one
+thread. Cell: nq100_mt, with nq100_st as the untouched control.
+
+## P44 — the arm sweep's nq13_mt x0.953, re-measured in isolation (probe; not counted)
+
+Six ABBA passes of nq=13 MT alone on Axion: base2 2.659-2.676,
+h69 2.462-2.624 — **x1.080 on mins, x1.041 on means**, every h69 pass
+below every base2 pass. The paired sweep's x0.953 for that point was
+the instrument (P4's floor), and the capstone stands with no point
+regressing on either arch.
