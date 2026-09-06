@@ -4588,3 +4588,114 @@ h69 2.462-2.624 — **x1.080 on mins, x1.041 on means**, every h69 pass
 below every base2 pass. The paired sweep's x0.953 for that point was
 the instrument (P4's floor), and the capstone stands with no point
 regressing on either arch.
+
+## H86 — VNNI batch width 4 at MT — REFUTED (non-win 11/20)
+
+x86, 2 rounds vs `h69`: nq100_mt 16.03-16.32 vs 17.49-17.85 —
+**x0.917** on mins, every h86 pass above every h69 pass; nq100_st
+(untouched by the gate) x0.96-0.97 on a drifting session. The shared
+L1D between hyperthreads is not the binding term at MT; the 25 sweeps
+of the codes that width 4 needs against 17 are. Reverted.
+**Verdict: non-win 11/20.**
+
+## Disposition — per-tile allocation reuse (non-win 12/20)
+
+P42 priced the per-query non-LUT work at ~9 us on Axion and ~10 us on
+x86 at ST, parallel at MT; the tile loop allocates its heaps and
+reference vectors per (quad, range) tile, 272-500 tiles per nq=100
+search, ~1-2% of the MT cells and nothing at ST (one range). At most
+~x1.007 on the 8-cell HM; not built.
+
+## H87 / H89 / H90 / H95 — last cheap constants — PRE-REGISTERED
+
+- **H87** x86 `TILES_PER_THREAD` 32 -> 64 (H81's other direction).
+- **H90** x86 nq=1 prefetch 8 -> 4 quads (H82's other direction; the
+  cells are L3-served, a shorter lookahead may waste less).
+- **H95** x86 nq=1 without the two-block interleave (`n_fours`/pairs
+  bypassed, every block single-stream): H34 won it against DRAM;
+  against L3 the second stream may be dead weight.
+- **H89** arm nq=1 MT: two block ranges per thread instead of one
+  (H103 refuted this at 4 bits from DRAM; at 2 bits the cell is at 85%
+  of supply).
+
+## H87 / H90 / H95 / H89 — REFUTED or marginal (non-wins 13, 14, 15, 16 / 20)
+
+Two ABBA rounds each vs `h69` (three for H89):
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H87 x86 `TILES_PER_THREAD` 32->64 | nq100_mt | 15.66-16.59 | 15.60-16.16 | x1.003 min / x1.012 mean — ranges overlap, flat |
+| H90 x86 nq=1 prefetch 8->4 | nq1_st | 1.30-1.78 | 1.43-1.78 | regime cell, unresolved |
+| | nq1_mt | 0.409-0.436 | 0.414-0.424 | x0.988 / x1.006 — flat |
+| H95 x86 nq=1 single-stream (no interleave, no prefetch) | nq1_st | 1.30-1.78 | 1.50-1.61 | x0.87 min / x0.97 mean — unresolved |
+| | nq1_mt | 0.409-0.436 | 0.404-0.414 | x1.012 / x1.027 — small, one cell (~x1.003 HM) |
+| H89 arm nq=1 MT, two ranges per thread | nq1_mt | 0.273-0.280 | 0.296-0.300 | **x0.922** — H103's verdict holds at 2 bits |
+
+H95's nq1_mt reading is the only positive number and cannot reach the
+bar alone; recorded as a term for anyone revisiting the x86 nq=1 kernel
+against an L3-resident index. **Verdicts: non-wins 13-16 of 20.**
+
+## H97 / H98 — last two smokes, and two dispositions — PRE-REGISTERED
+
+- **H97** x86 `MIN_TILE_BLOCKS_X86` 3x -> 2x the shared floor (the MT
+  tile floor at the batch-6 quad count).
+- **H98** arm single-query range stride floor 64 -> 128 blocks (longer
+  per-worker streams for the 85%-of-supply nq1_mt cell).
+- **Disposition, x86 nq=100 tail as 5+5 instead of 6+4 (non-win 19/20):**
+  P36 has widths 4 and 5 within 0.4% of each other per query; nothing to
+  gain.
+- **Disposition, arm LUT batch 4 -> 2 at MT (non-win 20/20 if H97/H98
+  fail):** halves the amortisation and doubles the sweeps; H12 measured
+  the wider direction and the arithmetic forbids the narrower.
+
+## H97 / H98 — REFUTED or marginal (non-wins 17, 18 / 20); dispositions 19, 20 — ROUND 2 CLOSED
+
+| | cell | h69 | cand | verdict |
+|---|---|---|---|---|
+| H97 x86 `MIN_TILE_BLOCKS_X86` 3x -> 2x | nq100_mt | 15.84-16.69 | 15.72-15.96 | x1.008 min / x1.025 mean on a session whose control spread (5%) exceeds the cell's band; at most ~2% on one cell, ~x1.003 on the HM. Not promoted. |
+| H98 arm nq=1 range stride floor 64 -> 128 | nq1_mt | 0.271-0.284 | 0.272-0.282 | x0.996 / x1.004 — flat |
+
+With the two dispositions registered above (x86 tail 5+5; arm LUT
+batch 2), **20 consecutive non-wins: round 2 is done.**
+
+### Round 2 — closing summary
+
+Baseline: main 1.0.0 (ccab9f32), 2026-09-06. Branch
+`perf/2bit-hillclimb-2`, worktree `~/git/tv-2bit-hc`.
+
+**Exact wins landed (parity-identical, sweeps clean, tests green):**
+
+| win | change | effect (vs HEAD at the time) |
+|---|---|---|
+| H53 | const-generic batch width for the x86 VNNI kernel (32 branch pairs + spills per quad removed) | x86 nq100 x1.27 / x1.36 |
+| H56 | VNNI batch width 6 (P36 measured the knee) | x86 nq100 +5-6% |
+| H60 | inline the block epilogue's early exit (six 13-arg calls per block removed) | x86 nq100 +5% |
+| H69 | prep + epilogue fixed costs: exact trunc rounding (x86), 4+4-product LUT build, arm top-k early exit | six cells +1-5% |
+
+**Capstone, cumulative build vs 1.0.0, one session per box:** 8-cell HM
+**x1.111** (WIN); x86 nq100_st x1.49, nq100_mt x1.50, nq1 cells
+x1.02-1.05; arm cells x1.02-1.04, nq1_st x0.995. Sweeps clean on both
+arches (one arm point re-measured, P44).
+
+**The big bet, H72:** a 2-bit SMMLA kernel on the vm8 layout for arm,
+allowed under a recall-equivalence gate. Correct; recall unchanged or
+slightly better on real data; on Axion **x1.73 / x1.68 on the nq=100
+cells and x0.65 / x0.70 at nq=1.** Not a win under the no-regression
+rule; committed inert behind `TURBOVEC_2BIT_VM8=1` with the trade
+recorded for Ryan's decision (opt-in layout, default-on, or the pair
+layout at x1.28 / x0.88).
+
+**Closed by measurement this round:** AMX on x86 (H99 in the 4-bit
+log: no tile renaming), LUT re-fetch traffic (H64), wider/narrower VNNI
+batches (H55/H57/H58/H86), the arm flush conversions (H70/H71), every
+round-1 constant re-asked at the new geometry (H81-H98), and the x86
+nq=1 kernel's stream count and prefetch depth against an L3-resident
+index (H79/H82/H90/H95).
+
+**What a round 3 should start from:** (1) the H72 decision — if the
+batched layout ships by default, a better nq=1 kernel on vm8 (halve the
+live group set; the tree spills) is the first hypothesis; (2) x86
+nq100_st's regime switching (P37) is external to the guest and bounds
+what any further x86 work can show; (3) the arm LUT kernels are at the
+issue bound of their formulation (P24/P27), so arm gains beyond H72
+need a formulation change, which the recall gate now permits.
