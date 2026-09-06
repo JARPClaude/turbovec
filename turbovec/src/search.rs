@@ -1207,6 +1207,25 @@ unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
             let vb = _mm512_set1_ps(bi[qi]);
             let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs), vb);
             let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs), vb);
+            // H60: the helper's common case — a full block, a filled heap and
+            // no lane above the heap minimum — is two multiplies, two
+            // compares and a mask test, but reaching it was an out-of-line
+            // call with thirteen arguments that forced every live
+            // accumulator to the stack first, six times per block. The test
+            // runs here on the same values; the helper is entered only when
+            // a lane can enter the heap, and recomputes the same products,
+            // so scores and tie order are unchanged.
+            if heap_sizes[qi] >= k && end - base_vec == BLOCK {
+                let vsp = vec_scales.as_ptr().add(base_vec);
+                let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vsp));
+                let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vsp.add(16)));
+                let thr = _mm512_set1_ps(heap_mins[qi]);
+                let m0 = _mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32;
+                let m1 = _mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32;
+                if (m0 | m1) == 0 {
+                    continue;
+                }
+            }
             avx512_post_flush_heap_update(
                 f0,
                 f1,

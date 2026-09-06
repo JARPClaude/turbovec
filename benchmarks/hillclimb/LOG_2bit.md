@@ -3526,3 +3526,199 @@ Cumulative x86 against the pinned 1.0.0 baseline after two wins:
 nq100_st **x1.255**, nq100_mt **x1.472**; arm unchanged by construction.
 
 Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H60 — inline the block epilogue's early exit into the VNNI kernel — PRE-REGISTERED
+
+Read from the `h56` machine code, width-6 instantiation. After the quad
+loop the kernel converts its twelve accumulators, **spills ten of them to
+the stack**, and makes **six out-of-line calls** per block to
+`avx512_post_flush_heap_update` — a thirteen-argument function whose
+overwhelmingly common case is "full block, filled heap, no lane above the
+heap minimum": two multiplies, two compares, one mask test, return. The
+call is what LLVM would not inline across the `target_feature` boundary,
+and the spills are its price: 6250 blocks x 17 batches x 6 queries =
+640k calls per nq=100 search, each with its argument shuffle and the
+accumulator traffic around it, against a quad loop of ~1250 cycles per
+block. Rough price 10-15% of the ST cell.
+
+Change: the kernel runs the same early-exit test inline on the same
+values and `continue`s; the helper is entered only when a lane can enter
+the heap (or the block is ragged, or the heap is still filling), and it
+recomputes the identical products, so scores and tie order are unchanged.
+Other kernels' call sites untouched (the 4-bit permute-dot epilogue is the
+4-bit observation's business). Queued behind P37 on x86, smoked against
+`h56`.
+
+## P37 — is x86 nq100_st's bimodality a placement artefact? — QUEUED
+
+Same `h56.so`, 8 processes each unpinned / `taskset -c 3` / `taskset -c 0`,
+20 searches per process, (min, median, max) per process. If pinning
+removes the slow mode the cell's band is scheduler placement on a 4-core
+8-vCPU guest and the harness's min-of-9 is the right estimator; if not,
+it is something the guest cannot see (L3 contention from neighbours, AVX
+frequency licence) and the cell stays a min-of-9 cell.
+
+## H57 — `VNNI_BATCH = 5` — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA vs `h56`: nq100_st 79.055 vs 69.994 (**x0.886**),
+nq100_mt 17.957 vs 17.101 (x0.952); every h57 sample above every h56
+sample. P36 put 5 within 2% of 6 per query at one batch, but nq=100 at 5
+is twenty sweeps of the codes against seventeen, and the sweep term shows
+at that scale where the one-batch probe could not see it. Reverted.
+
+## H58 — `VNNI_BATCH = 7` — marginal, NOT PROMOTED (non-win 2/20)
+
+x86, 2-pass ABBA vs `h56`: nq100_st 70.770 vs 71.819 (x1.015),
+nq100_mt 17.441 vs 17.661 (x1.013). Both positive, both inside the
+session's own spread for `h56` (ST 69.99-74.14 and MT 17.10-17.84 across
+the three smokes of this queue), and 100 = 14x7 + 2 puts the tail on the
+most expensive width. At most ~1.4% on two of eight cells, which cannot
+move the 8-cell HM to x1.01; a soak would price something the smoke
+already says is too small. Six stands as the measured optimum of the
+sweep {5, 6, 7, 8, 10}. Reverted.
+
+## H59 — prefetch in the batched VNNI kernel — positive, NOT PROMOTED alone (non-win 3/20)
+
+x86, 2-pass ABBA vs `h56`:
+
+```
+h56  nq100_st 71.726  nq100_mt 17.761
+h59  nq100_st 68.971  nq100_mt 17.911
+h59  nq100_st 68.371  nq100_mt 17.479
+h56  nq100_st 74.135  nq100_mt 17.559
+```
+
+**nq100_st x1.049**, both h59 samples below all six h56 ST samples of
+this queue; nq100_mt x1.005, inside band. H4/H5's -5% verdict on the
+branchy loop does not carry to the branch-free one: with the core term
+20% smaller the depth-8 lookahead now pays on the ST cell. But one cell at
++5% is ~x1.006 on the 8-cell HM, short of the bar on its own. Kept as a
+stackable term: **H61 = H60 + prefetch** is registered to run if H60
+lands, and the pair is judged together.
+
+## P37 — the x86 nq100_st modes are not placement (probe; not counted)
+
+`h56.so`, 8 processes per arm, 20 searches each, (min / median / max) ms:
+
+| arm | min range | median range |
+|---|---|---|
+| unpinned | 70.2-74.5 | 74.2-76.4 |
+| `taskset -c 3` | 71.9-73.5 | 74.6-75.8 |
+| `taskset -c 0` | 72.3-74.5 | 73.5-75.8 |
+
+Pinning changes nothing, and **no fast mode appeared in any of the 24
+processes** — the same binary read 58.8 and 60.3 in earlier sessions. So
+the "mode" is a property of the *time*, not the process: the box spends
+stretches in a ~60 ms regime and stretches in a ~72 ms one, and nothing
+inside the guest (core choice, hyperthread sibling) selects it. Neighbour
+pressure on the shared L3 or an AVX-512 frequency state are the remaining
+explanations and neither is observable from here. Consequences for the
+harness, both already in force: only interleaved ABBA readings are
+comparable, and min-of-9 per pass is the right estimator because the fast
+regime is the one a kernel change moves.
+
+## H60 — inline epilogue early exit — smoke
+
+x86, 2-pass ABBA vs `h56`:
+
+```
+h56  nq100_st 69.327  nq100_mt 17.702
+h60  nq100_st 67.252  nq100_mt 15.872
+h60  nq100_st 65.784  nq100_mt 16.153
+h56  nq100_st 68.867  nq100_mt 17.424
+```
+
+**nq100_st x1.047, nq100_mt x1.098**, every h60 sample below every h56
+sample on both cells. The MT cell gains more: the epilogue's calls and
+spills are per (block, query) work that does not shrink with more
+workers, so its share is larger where the scan itself is split eight
+ways. Promoted: soak vs `base2`, soak vs `h56`, sweep, 4-bit observation,
+`cargo test`; **H61 (H60 + prefetch) is queued behind it** and smoked
+against `h60`.
+
+## H62 — the same early exit in the single-query VNNI kernel — PRE-REGISTERED
+
+`search_single_query_vnni_blk2` makes one out-of-line
+`avx512_post_flush_heap_update` call per block (two per interleaved pair)
+with the same thirteen-argument shuffle. 6250 calls per nq=1 search at
+~40 cycles is ~0.08 ms of a 1.28 ms ST cell (~6%) if the call is what it
+costs in the batched kernel; the nq=1 cell is stream-bound, so the
+prediction is smaller than the batched case and may be zero if the call
+hides under the memory stalls. Tail blocks (ragged end) left as they are.
+Queued behind H61, smoked against `h60` on nq1_st, nq1_mt with nq100_mt
+as the untouched control.
+
+## H60 — soak and authority (sweep, obs4 and cargo test still running)
+
+**Soak vs `h56`, the climb HEAD** (x86, 2 balanced ABBA passes, min per
+label; `data/r2_h60/h60x_soak_*`):
+
+| cell | h56 | h60 | |
+|---|---|---|---|
+| nq100_st | 67.482 | 64.142 | **x1.0521** |
+| nq100_mt | 16.595 | 15.851 | **x1.0469** — every h60 pass (15.85-16.41) below every h56 pass (16.60-17.21) |
+| nq1_st | 1.293 | 1.290 | x1.0025 |
+| nq1_mt | 0.427 | 0.424 | x1.0081 |
+
+**Authority against the climb HEAD:** x86 4-cell HM x1.0269, **8-cell HM
+x1.0133, worst cell x1.0000 — VERDICT: WIN.** Parity digests identical.
+
+**Soak vs `base2`** (3 passes): nq100_st x1.3158, nq100_mt x1.5309,
+nq1_mt x0.9943, **nq1_st x0.9552** (1.348 against 1.288). Against the
+pinned baseline the cumulative 8-cell HM reads x1.0952, *below* H56's
+x1.0959 — and that reading is wrong about the change. The nq=1 cells run
+`search_single_query_vnni_blk2`, and the symbol- and address-blind
+disassembly of that function is **identical between `h56.so` and
+`h60.so`** (403 lines, 0 differing). H60 cannot have moved nq1_st; the
+1.348 is the bimodal cell drawing its slow regime during this soak (P37:
+the regime is a property of the time, not the process). So the ruling
+is made against the climb HEAD, where the same kernel is measured
+against itself in the same session: a WIN by x1.0133 with two cells at
++5%. The cumulative figure against the pinned 1.0.0 baseline is recorded
+as printed and will be re-read at the capstone, where every cell is
+measured in one session on both builds.
+
+**Rule, stated for the rest of round 2:** a candidate is judged by
+`whm_2bit.py` against the climb HEAD's cells from the same interleaved
+soak (HM > x1.01, no cell < x0.99). The pinned baseline is the capstone's
+reference, not the per-candidate one — a bimodal cell's draw must not be
+able to veto, or manufacture, a win in code it does not touch.
+
+## H60 — landed. VERDICT: WIN vs climb HEAD — round-2 win #3 (x1.0133 over H56)
+
+Remaining gates: paired sweep vs `base2`, 44 points, **none below 0.97**
+(worst n1000_st x1.004; nq=6 x1.49, nq=64 MT x1.49, N=200k MT x1.46).
+`cargo test -p turbovec`: 40 suites green on the x86 box and locally.
+4-bit observation (`h60_obs4_h60.json`, vs the round-2 base2 4-bit run):
+nq1_st x1.17 (bimodal), nq1_mt x1.06, nq100_st x0.983, nq100_mt x0.993 —
+the 4-bit path takes the permute-dot kernel whose epilogue this change
+does not touch; recorded, never gated, and its own H111-style inlining is
+a 4-bit question.
+
+Cumulative x86 against the pinned 1.0.0 baseline after three wins (this
+soak): nq100_st **x1.316**, nq100_mt **x1.531**; nq=1 cells unchanged.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20** (then H61
+below).
+
+## H61 — H60 + prefetch in the batched kernel — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA vs `h60`:
+
+```
+h60  nq100_st 67.066  nq100_mt 16.738
+h61  nq100_st 66.675  nq100_mt 16.971
+h61  nq100_st 64.441  nq100_mt 17.310
+h60  nq100_st 67.047  nq100_mt 16.042
+```
+
+nq100_st x1.040 (both h61 samples at or below both h60 samples), but
+**nq100_mt x0.945** — both h61 samples above both h60 samples. H59's
+MT reading of x1.005 was the smoke's band; with the cleaner epilogue the
+cost shows. H4/H5's mechanism stands for MT: eight workers each running
+a depth-8 lookahead over a shared L2/L3 evict what their neighbours are
+about to re-read, and no gain on ST buys a 5% MT regression under the
+no-regression rule. A ST-only prefetch (gated on `n_threads == 1`) is
+the obvious variant and is registered as H63. Reverted.
+
+**Verdict: non-win 1/20.**
