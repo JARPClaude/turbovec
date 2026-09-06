@@ -2926,7 +2926,59 @@ pub(crate) fn build_query_neon_lut_from_slice(
     for g in 0..n_byte_groups {
         let dim_start = g * codes_per_byte;
 
+        // H65: each entry is a sum of per-position products
+        // `q[d + c] * centroid[code_c]`; there are only `codes_per_nibble x
+        // 2^bits` distinct products per sub-table (8 at 2 bits, 16 at 4),
+        // not 16 x codes_per_nibble. Form them once and add them in the
+        // same order the per-entry loop did, so every f32 result is the
+        // same bit pattern.
+        let n_levels = 1usize << bits;
+        let mut prod = [[0.0f32; 16]; 4];
+        debug_assert!(codes_per_nibble <= 4 && n_levels <= 16);
+
+        if bits == 2 {
+            // H67: the 2-bit sub-table has a fixed shape — entry (a, b) is
+            // `q[d] * c[a] + q[d + 1] * c[b]` for a, b in 0..4 — so it is
+            // written as 4 + 4 products and 16 adds over fixed-size arrays,
+            // which LLVM vectorises on both arches. The sum is formed as
+            // `(0.0 + p_a) + p_b`, exactly the per-entry loop's order, so
+            // every f32 is the same bit pattern; min/max are exact.
+            let c4 = [centroids[0], centroids[1], centroids[2], centroids[3]];
+            let sub = |d: usize, out: &mut [f32]| -> (f32, f32) {
+                let pa = [q_rot_row[d] * c4[0], q_rot_row[d] * c4[1], q_rot_row[d] * c4[2], q_rot_row[d] * c4[3]];
+                let pb = [q_rot_row[d + 1] * c4[0], q_rot_row[d + 1] * c4[1], q_rot_row[d + 1] * c4[2], q_rot_row[d + 1] * c4[3]];
+                let mut mn = f32::MAX;
+                let mut mx = f32::MIN;
+                for a in 0..4 {
+                    for b in 0..4 {
+                        let v = (0.0f32 + pa[a]) + pb[b];
+                        out[a * 4 + b] = v;
+                        mn = if v < mn { v } else { mn };
+                        mx = if v > mx { v } else { mx };
+                    }
+                }
+                (mn, mx)
+            };
+            let (lo_min, lo_max) = sub(dim_start, &mut float_vals[g * 32..g * 32 + 16]);
+            let (hi_min, hi_max) = sub(dim_start + 2, &mut float_vals[g * 32 + 16..g * 32 + 32]);
+            mins[g * 2] = lo_min;
+            mins[g * 2 + 1] = hi_min;
+            bias += lo_min + hi_min;
+            let lo_span = lo_max - lo_min;
+            let hi_span = hi_max - hi_min;
+            if lo_span > max_span { max_span = lo_span; }
+            if hi_span > max_span { max_span = hi_span; }
+            sum_spans += lo_span + hi_span;
+            continue;
+        }
+
         // lo nibble sub-table (16 entries)
+        for c in 0..codes_per_nibble {
+            let q = q_rot_row[dim_start + c];
+            for (code, cent) in centroids[..n_levels].iter().enumerate() {
+                prod[c][code] = q * cent;
+            }
+        }
         let mut lo_min = f32::MAX;
         let mut lo_max = f32::MIN;
         for nibble_val in 0u16..16 {
@@ -2934,7 +2986,7 @@ pub(crate) fn build_query_neon_lut_from_slice(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot_row[dim_start + c] * centroids[code as usize];
+                s += prod[c][code as usize];
             }
             float_vals[g * 32 + nibble_val as usize] = s;
             if s < lo_min { lo_min = s; }
@@ -2942,6 +2994,12 @@ pub(crate) fn build_query_neon_lut_from_slice(
         }
 
         // hi nibble sub-table (16 entries)
+        for c in 0..codes_per_nibble {
+            let q = q_rot_row[dim_start + codes_per_nibble + c];
+            for (code, cent) in centroids[..n_levels].iter().enumerate() {
+                prod[c][code] = q * cent;
+            }
+        }
         let mut hi_min = f32::MAX;
         let mut hi_max = f32::MIN;
         for nibble_val in 0u16..16 {
@@ -2949,7 +3007,7 @@ pub(crate) fn build_query_neon_lut_from_slice(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot_row[dim_start + codes_per_nibble + c] * centroids[code as usize];
+                s += prod[c][code as usize];
             }
             float_vals[g * 32 + 16 + nibble_val as usize] = s;
             if s < hi_min { hi_min = s; }
@@ -3007,16 +3065,40 @@ pub(crate) fn build_query_neon_lut_from_slice(
         (1.0, 1.0)
     };
 
-    for g in 0..n_byte_groups {
-        let lo_min = mins[g * 2];
-        let hi_min = mins[g * 2 + 1];
-        for i in 0..16 {
-            let j_lo = g * 32 + i;
-            let j_hi = g * 32 + 16 + i;
-            uint8_luts[j_lo] =
-                ((float_vals[j_lo] - lo_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
-            uint8_luts[j_hi] =
-                ((float_vals[j_hi] - hi_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
+    // H65: `f32::round` is a libm call per entry (6,144 per query at dim
+    // 768) that the compiler cannot vectorise. `round_half_away` below is
+    // the same function — half away from zero — written from `trunc`, which
+    // is a single instruction, and `x - trunc(x)` is exact in f32, so every
+    // output byte is unchanged. Sixteen entries share a min, so the loop is
+    // shaped as one 16-lane chunk per sub-table.
+    #[inline(always)]
+    fn round_half_away(x: f32) -> f32 {
+        // aarch64 has `frinta` (round half away from zero) as one
+        // instruction and LLVM emits it for `f32::round`, so there the
+        // original is already the fast form; x86 has no such rounding mode
+        // and calls libm, which is what the `trunc` form avoids (H65b).
+        #[cfg(target_arch = "aarch64")]
+        {
+            return x.round();
+        }
+        #[allow(unreachable_code)]
+        let t = x.trunc();
+        let f = x - t;
+        if f >= 0.5 {
+            t + 1.0
+        } else if f <= -0.5 {
+            t - 1.0
+        } else {
+            t
+        }
+    }
+    for ((chunk, out), &m) in float_vals
+        .chunks_exact(16)
+        .zip(uint8_luts.chunks_exact_mut(16))
+        .zip(mins.iter())
+    {
+        for (o, &v) in out.iter_mut().zip(chunk) {
+            *o = round_half_away((v - m) * inv_scale).clamp(0.0, max_lut) as u8;
         }
     }
 
@@ -3756,6 +3838,22 @@ pub(crate) fn search(
                                 &mut block_out,
                             );
                             for q in 0..QBS_LUT {
+                                // H68: the helper's common case — heap full, whole block, no
+                                // lane above the heap minimum — tested here instead of behind
+                                // an out-of-line call with a stack frame, four times per block.
+                                // The helper is entered only when a lane can enter the heap and
+                                // runs the identical selection, so results are unchanged.
+                                if heap_sz[q] >= k && end_lane == BLOCK {
+                                    use std::arch::aarch64::*;
+                                    let p = block_out[q].as_ptr();
+                                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                                    if vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3))) <= heap_min[q] {
+                                        continue;
+                                    }
+                                }
                                 neon_block_topk_update(
                                     &block_out[q], base_vec, end_lane, mask, k,
                                     &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
