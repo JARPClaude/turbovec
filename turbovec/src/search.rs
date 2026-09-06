@@ -1050,11 +1050,32 @@ unsafe fn search_multi_query_vnni_dispatch(
             heap_mins, heap_min_idxs,
         )
     } else {
-        search_multi_query_vnni::<false>(
-            blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
-            n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
-            heap_mins, heap_min_idxs,
-        )
+        // H53: the batch width is a const generic so the per-query loop
+        // unrolls with no trip-count test, no slice bounds check and no
+        // accumulator spill per quad. One instantiation per width 2..=8:
+        // the sweep gate caught that padding a narrow batch up to 4 or 8
+        // (H53's first cut) costs nq=2 and nq=5 12-14%, so every width does
+        // exactly its own work. The driver pads `split_luts`, `scales` and
+        // `biases` to the batch width, so indices up to `nq` are valid.
+        macro_rules! vnni_nq {
+            ($n:literal) => {
+                search_multi_query_vnni::<false, $n>(
+                    blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
+                    n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+                    heap_mins, heap_min_idxs,
+                )
+            };
+        }
+        debug_assert!(split_luts.len() >= nq && scales.len() >= nq && biases.len() >= nq);
+        match nq {
+            2 => vnni_nq!(2),
+            3 => vnni_nq!(3),
+            4 => vnni_nq!(4),
+            5 => vnni_nq!(5),
+            6 => vnni_nq!(6),
+            7 => vnni_nq!(7),
+            _ => vnni_nq!(8),
+        }
     }
 }
 
@@ -1068,7 +1089,7 @@ unsafe fn search_multi_query_vnni_dispatch(
     enable = "avx512vnni"
 )]
 #[allow(clippy::too_many_arguments)]
-unsafe fn search_multi_query_vnni<const PF: bool>(
+unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
     blocked_codes: &[u8],
     split_luts: &[&[u8]],
     scales: &[f32],
@@ -1092,7 +1113,13 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
     // batch would be silently truncated, not scored. The batch dispatch
     // widens `nq_batch` past 8 only when the 10-lane permute-dot kernel
     // is the one taking the batch (see the width gate there).
-    debug_assert!(nq <= 8, "search_multi_query_vnni is 8-wide; got nq={nq}");
+    debug_assert!(nq <= NQ, "search_multi_query_vnni::<_, {NQ}> got nq={nq}");
+    // H53: fixed-size copies so every per-query access in the hot loop is a
+    // constant index into a local array — no slice bounds check, and the
+    // accumulators stay in zmm for the whole block.
+    let lut_ptrs: [*const u8; NQ] = std::array::from_fn(|i| split_luts[i].as_ptr());
+    let sc: [f32; NQ] = std::array::from_fn(|i| scales[i]);
+    let bi: [f32; NQ] = std::array::from_fn(|i| biases[i]);
 
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let m0f = _mm512_set1_epi8(0x0F);
@@ -1112,7 +1139,7 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
         // acc[q][h]: 16 u32 lanes = 16 vectors, halves h = vectors 0-15, 16-31.
         // Up to 8 queries: 16 zmm live, against the classic kernel's 16 at
         // only 4 queries.
-        let mut acc = [[_mm512_setzero_si512(); 2]; 8];
+        let mut acc = [[_mm512_setzero_si512(); 2]; NQ];
 
         for q4 in 0..quads {
             for h in 0..2 {
@@ -1145,8 +1172,8 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
                     _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f),
                     kpos,
                 );
-                for qi in 0..nq.min(8) {
-                    let tp = split_luts[qi].as_ptr().add(q4 * 128);
+                for qi in 0..NQ {
+                    let tp = lut_ptrs[qi].add(q4 * 128);
                     let tlo = _mm512_loadu_si512(tp as *const __m512i);
                     let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
                     acc[qi][h] = _mm512_dpbusd_epi32(
@@ -1164,15 +1191,15 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        for qi in 0..nq.min(8) {
+        for qi in 0..NQ {
             // H11: convert and bias at full width and hand two __m512 to the
             // 512-bit epilogue, exactly as the 4-bit permute-dot path has
             // done since H111 (+5.9% MT / +7.7% ST there). This kernel was
             // still splitting into four __m256 for the AVX2 epilogue — P6
             // priced the shipped cell 25% under the inner loop's roofline,
             // and this per-(block, query) code is where that gap lives.
-            let vs = _mm512_set1_ps(scales[qi]);
-            let vb = _mm512_set1_ps(biases[qi]);
+            let vs = _mm512_set1_ps(sc[qi]);
+            let vb = _mm512_set1_ps(bi[qi]);
             let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs), vb);
             let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs), vb);
             avx512_post_flush_heap_update(

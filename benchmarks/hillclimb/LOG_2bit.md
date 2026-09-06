@@ -3106,3 +3106,276 @@ VNNI kernel rounds once at the end, the arm classic kernel flushes), and the
 gate is per-arch against these.
 
 Non-win count: 0/20.
+
+## H51 — `TILES_PER_THREAD_NEON` 64 -> 32 on the rig — REFUTED (non-win 1/20)
+
+Axion, 2-pass ABBA smoke vs `base2`, min per label:
+
+```
+base2  nq100_mt 17.281  nq1_mt 0.265  nq100_st 137.465
+h51    nq100_mt 17.341  nq1_mt 0.273  nq100_st 135.755
+h51    nq100_mt 17.360  nq1_mt 0.269  nq100_st 136.254
+base2  nq100_mt 17.368  nq1_mt 0.269  nq100_st 135.579
+```
+
+nq100_mt x0.997 (band 0.6%), nq1_mt x0.985 (band 1.9%), nq100_st x1.000
+(one range at ST; untouched by construction). Round 1's +0.33% does not
+reproduce at 1.0.0; the candidate it left open is closed. Reverted.
+
+**Verdict: non-win 1/20.**
+
+## H53 — smoke, x86 (Sapphire Rapids), 2-pass ABBA vs `base2`
+
+```
+base2  nq100_st 86.662  nq100_mt 24.636
+h53    nq100_st 70.405  nq100_mt 19.356
+h53    nq100_st 70.312  nq100_mt 18.797
+base2  nq100_st 86.039  nq100_mt 24.296
+```
+
+**nq100_st x1.224, nq100_mt x1.293**, against control bands of 0.2% and
+0.4%. Every candidate sample is below every control sample by a wide
+margin. Built incrementally from ccab9f32 + `h53.patch` (`acb2f8a5`),
+HEAD verified before and after. Promoted to soak: 3 balanced ABBA passes
+of the full harness, paired nq/N sweep, 4-bit observation, `cargo test`.
+Arm: the patch is entirely inside `cfg(target_arch = "x86_64")` code, so
+the arm binary is expected byte-identical; checked by building it there.
+
+**Arm identity check for H53.** The arm `h53.so` hash differs from `base2.so`
+(`c6d2ff3f` vs `164dbd79`), but so does any source change: the crate hash
+feeds every mangled symbol, so a patch inside `cfg(x86_64)` still renames
+symbols on aarch64. An unpatched incremental build (`ctl3`) reproduces
+`base2` byte for byte, so the build is deterministic and the difference is
+the patch. Symbol-blind disassembly (addresses, symbol hashes and immediates
+normalised): 198,007 instruction lines each, **zero differing instructions**.
+The arm kernel is the same code, so the arm cells enter the verdict at
+x1.000 from the pinned baseline rather than being re-measured.
+
+## H53 — soak, gates and verdict on the first cut
+
+**Soak** (x86, 3 balanced ABBA passes of the full harness, prebuilt `.so`
+swapped per pass, min per label; files `data/r2_h53/`):
+
+| cell | base2 | h53 | |
+|---|---|---|---|
+| nq100_st | 85.340 | 68.486 | **x1.2461** |
+| nq100_mt | 24.140 | 18.689 | **x1.2917** |
+| nq1_st | 1.276 | 1.277 | x0.9995 |
+| nq1_mt | 0.423 | 0.426 | x0.9928 (band 0.7%) |
+
+Every h53 pass on both nq=100 cells is below every base2 pass (ST
+68.5-69.8 against 85.3-86.6; MT 18.7-19.0 against 24.1-24.7). The nq=1
+cells are the separate single-query kernel and read as drift.
+
+**Gates.** Parity digests identical to `base2` at both widths
+(`d8ce9ea9…` / `3314955a…`). `cargo test -p turbovec` green on the x86 box
+(all suites, 141 in the main one) and on the arm laptop with the patch
+applied (10 suites). Arm binary instruction-identical (above).
+
+**`whm_2bit.py` against the pinned baseline** (arm cells x1.0000 by
+identity):
+
+```
+cell            arm        x86
+  nq1_st       x1.0000    x1.2010   <- bimodal cell; not claimed
+  nq1_mt       x1.0000    x1.0008
+  nq100_st     x1.0000    x1.2528
+  nq100_mt     x1.0000    x1.2849
+  x86 4-cell HM  x1.1736
+  8-cell HM      x1.0799   worst cell x1.0000
+```
+
+Against the in-soak paired base2 (the drift-cancelling reading):
+x86 4-cell HM x1.1159, 8-cell HM **x1.0548**, worst cell nq1_mt_x86
+x0.9928, VERDICT: WIN. The pinned reading's x1.20 on nq1_st is the
+bimodal cell drawing its slow mode for the pin and its fast mode in the
+soak; the paired reading (x0.9995) is the honest one for that cell, and
+the 8-cell HM clears x1.01 by a factor of five either way.
+
+**4-bit observation** (never gated): recorded in
+`data/r2_h53/h53_obs4_*.json`; the 4-bit path is the permute-dot kernel
+and does not touch this code.
+
+**Sweep — and this is why the gate exists.** Paired A/B, 44 points, all
+measured (`data/r2_h53/h53_sweep.json`, ratio > 1 means the candidate is
+faster):
+
+| point | ST | MT |
+|---|---|---|
+| nq=2 | **x0.864** | x0.968 |
+| nq=3 | x1.127 | x1.085 |
+| nq=4 | x1.169 | x1.295 |
+| nq=5 | **x0.882** | **x0.929** |
+| nq=6 | x1.032 | x1.080 |
+| nq=7 | x1.162 | x1.175 |
+| nq=8..64 | x1.12-x1.41 | x1.14-x1.35 |
+| N=1k..200k (nq=100) | x1.03-x1.24 | x1.07-x1.30 |
+
+nq=2 and nq=5 regress 12-14%, far outside P4's 3% noise, and the mechanism
+is exactly the shape of the first cut: a batch narrower than the
+instantiation is padded up to it, so nq=2 does four queries' work and nq=5
+does eight. At nq=3/6/7 the branch-free loop outruns the padding; at 2 and
+5 it does not. **Not promoted in this form.** H53b instantiates every width
+2..=8 so no batch does padded work; the nq=100 cells are unaffected by
+construction (100 = 12x8 + 4, both exact already), so the soak above stands
+for them and H53b needs only its own smoke, parity and sweep.
+
+Harness note: the sweep driver segfaulted *after* writing all 44 points.
+It had imported turbovec itself to rebuild the small-N indexes (deleted for
+the v7 re-pin) and then overwrote the mapped `.so` in place for the A/B
+swaps; the crash is the interpreter tearing down a module whose file
+changed under it. Round 1 never hit this because its small-N indexes were
+already cached. The H53b sweep runs with the indexes present and should not
+reproduce it; if it does, the harness gets a fix, not the candidate.
+
+## H53b — one instantiation per width 2..=8 — gates
+
+Built incrementally from ccab9f32 + `h53b.patch` (`2c56e476`). Smoke
+against `h53` on the objective cells: nq100_st 70.22 vs 70.16 (x0.999),
+nq100_mt 18.34 vs 18.99 (x1.035) — the same code on the nq=100 path, as
+predicted (the MT figure is the bimodal side of that cell drawing
+differently; the soak decides). Smoke against `base2`: nq100_st x1.221,
+nq100_mt x1.30, nq1 cells inside band.
+
+Parity digests identical to `base2` at both widths. Arm build
+instruction-identical to the control (symbol-blind diff: 0 instructions).
+Local `cargo test -p turbovec` with the patch: 40 suites green.
+
+**Sweep, paired A/B, 44 points, no segfault this time** (the small-N
+indexes were cached, which confirms the harness reading above):
+
+| point | ST | MT |
+|---|---|---|
+| nq=2 | **x1.236** | x1.188 |
+| nq=3 | x1.225 | — |
+| nq=5 | **x1.328** | x1.298 |
+| nq=6 | x1.411 | — |
+| nq=7 | x1.311 | — |
+| nq=8 / 16 / 64 | x1.304 / x1.293 / x1.243 | — |
+| N=1k / 8k / 32k / 200k (nq=100) | x1.035 / x1.146 / x1.231 / x1.233 | 200k: x1.348 |
+
+**No point below 0.97; the worst is nq1_mt at x0.995**, which is the
+single-query kernel and noise. The two padding regressions of the first
+cut are now the two largest ST gains in the nq sweep. Soak launched (3
+balanced ABBA passes); the verdict is the soak through `whm_2bit.py`.
+
+## H54 — range-major block tiling for the single-thread scan — PRE-REGISTERED
+
+`n_block_ranges` returns 1 whenever the pool has one thread, by design
+("identical work and visit order to the serial scan"). So at ST every
+query batch sweeps the whole 38 MB of codes: 13 sweeps at nq=100 on x86
+(batch 8), 25 on arm (batch 4). P26 priced the DRAM term of the 2-bit scan
+at 12.5% of the loop at N=200k for nq=1; at nq=100 the compute per byte is
+higher and the term smaller, but it is paid on every sweep. The MT path
+already tiles (query-quad x block-range) and its tile order is range-major
+with quads inner, and the cross-range merge is deterministic (score desc,
+index asc), so a one-thread pool can take the same tiles with no change to
+results.
+
+Change: with one thread and more than one quad, split the block axis into
+ranges of `ST_RANGE_BLOCKS = 256` blocks (1.5 MB of 2-bit codes, L2-resident
+on both rig cores), capped by `range_cap_for_k`. Untouched: nq=1 (one
+quad), MT, masked and scalar paths. Prediction: nq100_st improves on both
+arches; other cells unchanged. Parity must hold by the merge's
+determinism. The 4-bit observation may move either way (3 MB ranges).
+
+## H55 — VNNI batch width 10 — PRE-REGISTERED (x86, on top of H53b)
+
+With the width const-generic, 10 queries fit the register file (20 zmm of
+accumulators + 8 temporaries) where 12 would spill. nq=100 becomes ten
+sweeps of the codes instead of thirteen, and the per-quad shared decode
+(2 loads, and/shift/or) amortises over 10 queries. Risk: the batch's LUT
+set grows from 48 KB to 60 KB, past L1D (48 KB on Sapphire Rapids), so
+`vpermb`'s table operands come from L2 more often. Round 1's H12 refuted
+the analogous 4 -> 8 widening on arm as L1-bound; this is the x86 version
+of the same question, and the answer is measured, not argued. Instantiation
+arms added for widths 9 and 10; `nq_batch` becomes 10 for the VNNI path
+when that reduces the batch count.
+
+## H54 — range-major ST tiling — REFUTED on arm (non-win 2/20)
+
+Axion, 2-pass ABBA smoke vs `base2`, min per label:
+
+```
+base2  nq100_st 132.761  nq1_st 1.643  nq100_mt 17.147
+h54    nq100_st 140.351  nq1_st 1.636  nq100_mt 17.016
+h54    nq100_st 140.137  nq1_st 1.653  nq100_mt 17.202
+base2  nq100_st 132.460  nq1_st 1.659  nq100_mt 17.271
+```
+
+**nq100_st x0.945** — every candidate sample above every control sample,
+against a 0.6% band. nq1_st and nq100_mt flat, as the patch predicts
+(untouched paths). The L2-residency the change buys is real but smaller
+than what it costs: 25 ranges means every query's top-k is re-filled from
+empty 25 times, and the fill phase runs without the whole-block prune that
+makes the steady state cheap. The MT path pays the same per-range cost but
+spreads it over eight workers that would otherwise idle; one worker has no
+such offset. Round 1's note that "the per-range top-k duplication is
+exactly the cost the k cap argued for" applies with full force at ST.
+
+Not run on x86: a 5.5% regression on an arm cell fails the no-regression
+gate whatever x86 does, and the mechanism is arch-independent. Reverted.
+
+**Verdict: non-win 2/20.**
+
+*Arm status after H54.* The arm nq=100 ST loop is 54 instructions per
+byte-group for 4 queries and the core issues 4 SIMD ops per cycle (P27);
+192 groups x 6250 blocks x 25 batches at 13.5 cycles is 135 ms at 3 GHz,
+which is the measured cell. It is at the issue bound of its formulation,
+and the instruction that could go — the four widening adds per query — is
+pinned by the u8 LUT ceiling (127) that bit-identity fixes. Every
+remaining arm lever on this cell is a formulation change round 1 closed
+(P5, H12, H29). The climb's live ground is x86.
+
+## H53b — landed. `whm_2bit.py` VERDICT: WIN — round-2 win #1 (8-cell HM x1.0871)
+
+**Soak** (x86, 3 balanced ABBA passes, min per label; `data/r2_h53b/`):
+
+| cell | base2 | h53b | |
+|---|---|---|---|
+| nq100_st | 80.568 | 67.816 | **x1.1880** (base2 drew its fast mode once, p12; against the other five passes, 84.6-86.2, it is x1.25) |
+| nq100_mt | 23.891 | 17.698 | **x1.3499** |
+| nq1_st | 1.276 | 1.278 | x0.9980 |
+| nq1_mt | 0.422 | 0.426 | x0.9915 |
+
+Every h53b pass below every base2 pass on both nq=100 cells (ST 67.8-68.9
+vs 80.6-86.2; MT 17.7-18.5 vs 23.9-24.6).
+
+**Authority, against the pinned baseline** (arm x1.0000 by instruction
+identity):
+
+```
+cell            arm        x86
+  nq1_st       x1.0000    x1.1995   (bimodal cell; the paired reading is x0.998)
+  nq1_mt       x1.0000    x1.0018
+  nq100_st     x1.0000    x1.2652
+  nq100_mt     x1.0000    x1.3568
+  x86 4-cell HM  x1.1907
+  8-cell HM      x1.0871   worst cell x1.0000
+VERDICT: WIN
+```
+
+Against the paired in-soak base2: x86 4-cell HM x1.1132, **8-cell HM
+x1.0536, worst cell nq1_mt_x86 x0.9915** (floor 0.99), VERDICT: WIN. Both
+readings clear x1.01 by a wide margin; the honest headline is the paired
+one for the nq=1 cells and the pinned one for nq=100, and the verdict is
+the same either way.
+
+**4-bit observation** (recorded, never gated; measured on `h53`, whose
+4-bit path is byte-for-byte the same code as `h53b`'s): nq1_st x1.17
+(the bimodal cell), nq1_mt x1.02, nq100_st x1.01, nq100_mt x0.995 — the
+4-bit path runs the permute-dot kernel and does not touch this code.
+
+**What it teaches.** P6/P7 measured a 17% gap between a constant-width
+probe and the shipped cell and attributed it to "probe idealization"; the
+gap was the runtime width. The kernel's *source* had the right shape — an
+8-wide accumulator array and a clamped loop — and only the machine code
+showed the 32 compare-and-branch pairs and the per-quad spills that the
+runtime bound left in. Two lessons for the rest of this climb: (1) read
+the disassembly of the shipped kernel before pricing its roofline from a
+probe, because a probe with a constant trip count cannot see a runtime
+one; (2) a "kernel at roofline" verdict that rests on a probe is only as
+good as the probe's fidelity to the loop's *control* structure, not just
+its instruction mix.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
