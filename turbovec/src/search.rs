@@ -346,6 +346,115 @@ pub fn reset_blocks_skipped_by_mask() {
     BLOCKS_SKIPPED_BY_MASK.store(0, Ordering::Relaxed);
 }
 
+/// H72: the single-query LUT scan over 2-bit codes in the `vm8` layout.
+///
+/// Same arithmetic as [`score_4bit_block_neon`] — the u8 tables, the u8
+/// pre-add, the u16 accumulators and the flush — so scores are bit-identical
+/// to the sequential-layout kernel on the same index. What differs is the
+/// load: a `vm8` octet holds 32 vectors x 8 byte-groups with each vector's
+/// eight bytes adjacent, so the eight group registers the LUT step wants
+/// come from a three-level `UZP` tree over eight 16-byte loads (per 16
+/// vectors), 24 permutes per 128 B. That is the price of the layout at nq=1;
+/// H72's probe measures it.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_2bit_block_vm8_neon(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(n_byte_groups % 8, 0);
+
+    let mask = vdupq_n_u8(0x0F);
+    let v_scale = vdupq_n_f32(scale);
+    let mut fa = [vdupq_n_f32(bias); 8];
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let luts_base = uint8_luts.as_ptr();
+    let octs = n_byte_groups / 8;
+    let mut accum = [vdupq_n_u16(0); 4];
+
+    #[inline(always)]
+    unsafe fn groups_of(p: *const u8) -> [uint8x16_t; 8] {
+        let r: [uint8x16_t; 8] = std::array::from_fn(|i| vld1q_u8(p.add(i * 16)));
+        let t = [
+            vuzp1q_u8(r[0], r[1]), vuzp1q_u8(r[2], r[3]), vuzp1q_u8(r[4], r[5]), vuzp1q_u8(r[6], r[7]),
+            vuzp2q_u8(r[0], r[1]), vuzp2q_u8(r[2], r[3]), vuzp2q_u8(r[4], r[5]), vuzp2q_u8(r[6], r[7]),
+        ];
+        let u = [
+            vuzp1q_u8(t[0], t[1]), vuzp1q_u8(t[2], t[3]), vuzp2q_u8(t[0], t[1]), vuzp2q_u8(t[2], t[3]),
+            vuzp1q_u8(t[4], t[5]), vuzp1q_u8(t[6], t[7]), vuzp2q_u8(t[4], t[5]), vuzp2q_u8(t[6], t[7]),
+        ];
+        [
+            vuzp1q_u8(u[0], u[1]), vuzp1q_u8(u[4], u[5]), vuzp1q_u8(u[2], u[3]), vuzp1q_u8(u[6], u[7]),
+            vuzp2q_u8(u[0], u[1]), vuzp2q_u8(u[4], u[5]), vuzp2q_u8(u[2], u[3]), vuzp2q_u8(u[6], u[7]),
+        ]
+    }
+
+    for o in 0..octs {
+        let ga = groups_of(codes_base.add(o * 256));
+        let gb = groups_of(codes_base.add(o * 256 + 128));
+        for j in 0..8 {
+            let lp = luts_base.add((8 * o + j) * 32);
+            let lut_hi = vld1q_u8(lp);
+            let lut_lo = vld1q_u8(lp.add(16));
+            let (c0, c1) = (ga[j], gb[j]);
+            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
+            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
+            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
+            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
+        }
+        // Flush at the same cadence as the sequential kernel (one batch of
+        // FLUSH_EVERY groups); octets never straddle a batch boundary since
+        // FLUSH_EVERY is a multiple of 8.
+        if (o + 1) * 8 % FLUSH_EVERY == 0 || o + 1 == octs {
+            let magic_i = vdupq_n_u32(0x4B00_0000);
+            let magic_f = vdupq_n_f32(8_388_608.0);
+            let zero16 = vdupq_n_u16(0);
+            for i in 0..4 {
+                let lo_u = vreinterpretq_u32_u16(vzip1q_u16(accum[i], zero16));
+                let hi_u = vreinterpretq_u32_u16(vzip2q_u16(accum[i], zero16));
+                let lo = vsubq_f32(vreinterpretq_f32_u32(vorrq_u32(lo_u, magic_i)), magic_f);
+                let hi = vsubq_f32(vreinterpretq_f32_u32(vorrq_u32(hi_u, magic_i)), magic_f);
+                fa[i * 2] = vfmaq_f32(fa[i * 2], v_scale, lo);
+                fa[i * 2 + 1] = vfmaq_f32(fa[i * 2 + 1], v_scale, hi);
+            }
+            accum = [vdupq_n_u16(0); 4];
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let out_ptr = out.as_mut_ptr();
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    if end - base_vec == BLOCK {
+        for i in 0..8 {
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+            vst1q_f32(out_ptr.add(i * 4), vmulq_f32(fa[i], n));
+        }
+    } else {
+        let mut float_accum = [0.0f32; BLOCK];
+        for i in 0..8 {
+            vst1q_f32(float_accum.as_mut_ptr().add(i * 4), fa[i]);
+        }
+        for lane in 0..BLOCK {
+            *out_ptr.add(lane) = if lane < end - base_vec {
+                float_accum[lane] * *vec_scales_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn score_4bit_block_neon(
     blocked_codes: &[u8],
@@ -2567,6 +2676,106 @@ unsafe fn score_block_permute_smmla_neon<const NQ: usize, const NP: usize>(
 /// No flush: the widest possible sum over 768 dimensions is `768 * 127 *
 /// 127` ~ 1.2e7, well inside i32, so the `FLUSH_EVERY` cadence and the u8
 /// pre-add that capped the LUT at 127 both leave this path.
+/// H72: 2-bit codes in the `vm8` layout scored with `SMMLA`.
+///
+/// A 16-byte load is two vectors x eight byte-groups; each byte holds four
+/// 2-bit codes (bits 7:6 = dim 4g, 5:4 = 4g+1, 3:2 = 4g+2, 1:0 = 4g+3). Two
+/// 16-entry tables turn the masked low nibble and the shifted high nibble
+/// into the four level registers, and each level register is already an
+/// `SMMLA` B operand: bytes 0-7 are vector 0's dims `4g + k` over the octet,
+/// bytes 8-15 vector 1's. The A operands (`build_smmla_a_vm8_2bit`) are the
+/// query pairs' weights in that same dimension order, so no ZIP is needed.
+///
+/// Scores are `bias + scale * i32` with the query rounded to i8 per
+/// dimension and the codebook to i8 — not bit-identical to the LUT path.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_smmla_vm8_2bit<const NQ: usize, const NP: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    a_buf: &[i8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+    const { assert!(NQ == 2 * NP, "SMMLA tiles queries in pairs") };
+
+    let pairs = NP;
+    let mask = vdupq_n_u8(0x0F);
+    let ta = vld1q_s8(pds[0].levels.as_ptr());
+    let tb = vld1q_s8(pds[0].levels2.as_ptr());
+    let octs = n_byte_groups / 8;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    for part in 0..8 {
+        let mut acc = [[vdupq_n_s32(0); 2]; NP];
+        for q8 in 0..octs {
+            let ap = a_base.add(q8 * pairs * 64);
+            for r in 0..2 {
+                let c = vld1q_u8(codes_base.add(q8 * 256 + (part * 2 + r) * 16));
+                let lo = vandq_u8(c, mask);
+                let hi = vshrq_n_u8(c, 4);
+                // Stored byte order is big-endian in dimensions: bits 7:6 =
+                // dim 4g, 5:4 = 4g+1, 3:2 = 4g+2, 1:0 = 4g+3 (see
+                // `pack::build_extract_lut`), so the high nibble carries the
+                // first two dims and the low nibble the last two.
+                let f0 = vqtbl1q_s8(tb, hi);
+                let f1 = vqtbl1q_s8(ta, hi);
+                let f2 = vqtbl1q_s8(tb, lo);
+                let f3 = vqtbl1q_s8(ta, lo);
+                for p in 0..pairs {
+                    let a = ap.add(p * 64);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a), f0);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(16)), f1);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(32)), f2);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(48)), f3);
+                }
+            }
+        }
+        for p in 0..pairs {
+            for (r, q) in [2 * p, 2 * p + 1].into_iter().enumerate() {
+                let vs = vdupq_n_f32(pds[q].scale);
+                let vb = vdupq_n_f32(pds[q].bias);
+                let (x, y) = (acc[p][0], acc[p][1]);
+                let t = if r == 0 {
+                    vcombine_s32(vget_low_s32(x), vget_low_s32(y))
+                } else {
+                    vcombine_s32(vget_high_s32(x), vget_high_s32(y))
+                };
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(t), vs);
+                vst1q_f32(raw[q].as_mut_ptr().add(part * 4), f);
+            }
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 #[allow(clippy::too_many_arguments)]
@@ -2755,6 +2964,11 @@ unsafe fn neon_block_topk_update(
 
 pub(crate) struct QueryNeonLut {
     pub(crate) uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
+    /// H72: the 2-bit SMMLA operand set (aarch64, vm8 layout at 2 bits).
+    /// `None` unless this index is in that layout; the nq=1 path never reads
+    /// it, so the single-query LUT kernel is unaffected by its presence.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) pd2: Option<QueryPermuteDot>,
     /// The same table reordered for `vpermb` (see [`split_lut_for_vnni`]).
     /// Empty unless this process and geometry use the vector-major layout;
     /// built once per query rather than per tile.
@@ -2829,6 +3043,12 @@ pub(crate) struct QueryPermuteDot {
     /// The codebook as int8. x86 biases this by +128 in-register to feed
     /// `vpdpbusd`'s unsigned operand; `SDOT` reads it directly.
     pub(crate) levels: [i8; 16],
+    /// H72: at 2 bits a byte holds four codes and two 16-entry tables serve
+    /// them: `levels[i] = level[i & 3]` for the fields at bits 1:0 / 5:4 and
+    /// `levels2[i] = level[(i >> 2) & 3]` for the fields at bits 3:2 / 7:6,
+    /// indexed by the masked low nibble and the shifted high nibble.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) levels2: [i8; 16],
     /// One int8 weight per dimension, grouped to match the 4-byte reduction:
     /// bytes `q4*8 .. q4*8+4` hold the *low*-nibble dimensions of byte-groups
     /// `4*q4 .. 4*q4+4`, and bytes `q4*8+4 .. q4*8+8` the high-nibble ones —
@@ -2889,11 +3109,64 @@ fn build_permute_dot(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryP
 
     QueryPermuteDot {
         levels,
+        levels2: [0; 16],
         weights,
         zero: -128 * wsum,
         scale: cs * qs,
         bias: 0.0,
     }
+}
+
+/// H72: the SMMLA operand set for 2-bit codes. The query is rounded to i8
+/// per dimension in plain dimension order; the four codebook levels become
+/// two 16-entry tables (see `QueryPermuteDot::levels2`). `scale` restores
+/// both quantisations; `bias` receives the TQ+ correction from the caller.
+#[cfg(target_arch = "aarch64")]
+fn build_permute_dot_2bit(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryPermuteDot {
+    debug_assert!(centroids.len() >= 4);
+    let cmax = centroids[..4].iter().fold(0.0f32, |m, &c| m.max(c.abs()));
+    let cs = if cmax > 0.0 { cmax / 127.0 } else { 1.0 };
+    let mut lv = [0i8; 4];
+    for (l, &c) in lv.iter_mut().zip(centroids[..4].iter()) {
+        *l = (c / cs).round().clamp(-127.0, 127.0) as i8;
+    }
+    let mut levels = [0i8; 16];
+    let mut levels2 = [0i8; 16];
+    for i in 0..16 {
+        levels[i] = lv[i & 3];
+        levels2[i] = lv[(i >> 2) & 3];
+    }
+    let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let qs = qmax / 127.0;
+    let (qs, inv_qs) = if qs >= f32::MIN_POSITIVE { (qs, 1.0 / qs) } else { (1.0, 1.0) };
+    let weights: Vec<i8> = q_rot_row[..dim]
+        .iter()
+        .map(|&v| (v * inv_qs).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    QueryPermuteDot { levels, levels2, weights, zero: 0, scale: cs * qs, bias: 0.0 }
+}
+
+/// H72: `SMMLA` A-operands for 2-bit codes in the `vm8` layout, once per
+/// tile. Field `k` of the unpacked 16-byte register holds, for two vectors,
+/// their dimensions `4g + k` for the octet's eight groups `g`; entry
+/// `(q8 * pairs + p) * 64 + k * 16` is the matching 2-query x 8-dim operand.
+#[cfg(target_arch = "aarch64")]
+fn build_smmla_a_vm8_2bit<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], octs: usize) -> Vec<i8> {
+    let pairs = NQ / 2;
+    let mut a = vec![0i8; octs * pairs * 64];
+    for q8 in 0..octs {
+        for p in 0..pairs {
+            let dst = (q8 * pairs + p) * 64;
+            for k in 0..4 {
+                for (r, pd) in pds[2 * p..2 * p + 2].iter().enumerate() {
+                    for j in 0..8 {
+                        a[dst + k * 16 + r * 8 + j] = pd.weights[4 * (8 * q8 + j) + k];
+                    }
+                }
+            }
+        }
+    }
+    a
 }
 
 /// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
@@ -3118,6 +3391,12 @@ pub(crate) fn build_query_neon_lut_from_slice(
             split_lut_for_vnni(&uint8_luts, n_byte_groups)
         } else {
             Vec::new()
+        },
+        #[cfg(target_arch = "aarch64")]
+        pd2: if crate::pack::vm8_2bit_for(bits, n_byte_groups) {
+            Some(build_permute_dot_2bit(q_rot_row, centroids, dim))
+        } else {
+            None
         },
         pd,
         uint8_luts,
@@ -3397,6 +3676,10 @@ pub(crate) fn search(
                 // TQ+ correction has to land there too.
                 pd.bias += bias_corrs[qi];
             }
+            #[cfg(target_arch = "aarch64")]
+            if let Some(pd) = lut.pd2.as_mut() {
+                pd.bias += bias_corrs[qi];
+            }
             lut
         })
         .collect();
@@ -3474,6 +3757,11 @@ pub(crate) fn search(
                             scales_slice, base, range_vecs, &mut out,
                         );
                     }
+                } else if lut.pd2.is_some() {
+                    score_2bit_block_vm8_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
                 } else {
                     score_4bit_block_neon(
                         codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
@@ -3656,7 +3944,8 @@ pub(crate) fn search(
         // spills; quarter-block accumulators (2 per query) and indexed
         // weights (1 register per query per two quads) bring the working
         // set to 24 of 32, which is what makes 8 fit. See LOG_search.md H32.
-        let pd_batched = query_luts.first().is_some_and(|l| l.pd.is_some());
+        let pd_batched = query_luts.first().is_some_and(|l| l.pd.is_some() || l.pd2.is_some());
+        let pd2_batched = query_luts.first().is_some_and(|l| l.pd2.is_some());
         // H84: batch width re-test. H40 refuted 12 and 16 on the 4-group
         // SMMLA kernel, where NQ=12 needed 24 accumulators. vm8's
         // eighth-blocks (H41) need NP*2 = 12, and 100/12 = 9 sweeps over
@@ -3736,17 +4025,17 @@ pub(crate) fn search(
                 macro_rules! pd_scan {
                     ($n:literal, $np:literal) => {{
                         let pds: [&QueryPermuteDot; $n] = std::array::from_fn(|i| {
-                            query_luts[qi_start + i]
-                                .pd
-                                .as_ref()
-                                .expect("pd built for every query")
+                            let l = &query_luts[qi_start + i];
+                            l.pd.as_ref().or(l.pd2.as_ref()).expect("pd built for every query")
                         });
                         // One reshape of the batch's weights, reused by
                         // every block below. Which reshape depends on the
                         // layout in memory, which pack.rs decided at load
                         // or encode time — the two must not disagree.
                         let vm8 = crate::pack::vm8_for(bits, n_byte_groups);
-                        let a_buf = if vm8 {
+                        let a_buf = if pd2_batched {
+                            build_smmla_a_vm8_2bit::<$n>(&pds, n_byte_groups / 8)
+                        } else if vm8 {
                             build_smmla_a_vm8::<$n>(&pds, n_byte_groups / 8)
                         } else if have_i8mm() {
                             build_smmla_a::<$n>(&pds, n_byte_groups / 4)
@@ -3762,7 +4051,13 @@ pub(crate) fn search(
                             let block_offset = block_idx * n_byte_groups * BLOCK;
                             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                             unsafe {
-                                if vm8 {
+                                if pd2_batched {
+                                    score_block_smmla_vm8_2bit::<$n, $np>(
+                                        blocked_codes, &pds, &a_buf, block_offset,
+                                        n_byte_groups, vec_scales, base_vec, n_vectors,
+                                        &mut block_out,
+                                    );
+                                } else if vm8 {
                                     score_block_smmla_vm8::<$n, $np>(
                                         blocked_codes, &pds, &a_buf, block_offset,
                                         n_byte_groups, vec_scales, base_vec, n_vectors,
@@ -3892,6 +4187,12 @@ pub(crate) fn search(
                                             vec_scales, base_vec, n_vectors, &mut block_out,
                                         );
                                     }
+                                } else if qlut.pd2.is_some() {
+                                    score_2bit_block_vm8_neon(
+                                        blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                        qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors,
+                                        &mut block_out[0],
+                                    );
                                 } else {
                                     score_4bit_block_neon(
                                         blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,

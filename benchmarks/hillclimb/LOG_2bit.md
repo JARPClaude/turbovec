@@ -4393,3 +4393,78 @@ Cumulative against the pinned 1.0.0 baseline: 8-cell HM **x1.1105**;
 x86 nq100_st x1.32, nq100_mt x1.51, arm nq100_st x1.04.
 
 Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H70 — exact magic-number flush, arm 4-query kernel — marginal, NOT PROMOTED (non-win 1/20)
+
+Axion, 2 ABBA rounds vs `h69`:
+
+| cell | h69 | h70 | |
+|---|---|---|---|
+| nq100_st | 143.3-144.1 | 143.0-144.2 | x1.002 (min) / x1.001 (mean) — flat |
+| nq100_mt | 17.34-17.64 | 17.17-17.50 | x1.010 (min) / x1.006 (mean) — ranges overlap |
+
+Parity identical. The prediction (2-3%) priced the flush at its issue
+slots — 8 `ushll` at 2/cycle and 8 `ucvtf` at 1/cycle per query per
+block — but the flush sits once per block behind a 192-group loop with
+plenty of independent work, and the out-of-order window hides it: the
+slow rows cost issue slots the loop was not short of. Real at most ~1%
+on one cell, cannot reach the bar; reverted. (H71, the same change in
+the nq=1 kernel where the flush is a larger share of a shorter block,
+is queued and gets its own reading.)
+
+**Verdict: non-win 1/20.**
+
+## H71 — magic-number flush, arm nq=1 kernel — flat, NOT PROMOTED (non-win 2/20)
+
+Axion, 2 rounds vs `h70`: nq1_st x0.998, nq1_mt x1.012 (inside its 1.9%
+band), nq100_mt x0.998 (control). Same lesson as H70: the flush's slow
+issue rows are hidden by the out-of-order window even in the short nq=1
+block. Reverted. **Verdict: non-win 2/20.**
+
+## H72 — Axion: the probe, the kernel, the gates, and the trade
+
+**Probe (`smmla2_probe.c`, two runs, G(q.dim)/s):**
+
+| variant | Axion | vs LUT4 (124) |
+|---|---|---|
+| LUT 4-query, sequential | 121-124 | — |
+| SMMLA pair, nq=8 / 12 | 157 / 162 | x1.27 / x1.30 |
+| **SMMLA vm8, nq=8** | **183-185** | **x1.49** |
+| SMMLA vm8, nq=12 | 159-161 | x1.30 (spills) |
+| LUT nq=1 sequential | 88-93 | — |
+| LUT nq=1 pair (LD2 / UZP) | 77-83 / 77-81 | x0.88 |
+| LUT nq=1 vm8 UZP tree | 67 | x0.73 |
+| LUT nq=1 vm8 LD4 x2 | 58-59 | x0.64 |
+| SMMLA nq=1 duplicated query | 61-63 | x0.67 |
+
+**The kernel in the crate, toggle A/B on the harness index, two ABBA
+rounds** (`smoke_env.sh`, same `.so`, layout chosen at load):
+
+| cell | LUT (HEAD) | SMMLA/vm8 | |
+|---|---|---|---|
+| nq100_st | 129.6-135.4 | 75.0-78.1 | **x1.727** |
+| nq100_mt | 16.87-17.12 | 10.06-10.17 | **x1.676** |
+| nq1_st | 1.622-1.682 | 2.513-2.543 | x0.645 |
+| nq1_mt | 0.262-0.277 | 0.372-0.385 | x0.704 |
+
+The batched gain in the real kernel (x1.7) exceeds the probe's x1.49:
+the crate kernel runs 8 parts x 2 accumulators per pair against the
+probe's 4 x 4 and the batch dispatch takes 12/8/4-wide chunks. The nq=1
+loss in the real cell (x0.65) is worse than the probe's x0.73 — the
+16-register group set of the UZP tree plus the LUT step likely spills.
+
+**Gates.** Recall on Axion identical to the local runs: OpenAI-1536
+recall@1 TQ 0.888 -> 0.889, TQ+ 0.901 -> 0.904; uniform harness +0.0008
+with 92% top-10 overlap. Parity digests differ at 2 bits (by design) and
+match at 4 bits. `cargo test` 40/40 in both modes.
+
+**Verdict under the goal as written: NOT A WIN** — two cells regress by
+30-35% and the 8-cell HM falls to ~0.98 even with the other two up x1.7.
+As a *product* change it is a real 1.7x for batched search on arm at an
+unchanged recall, which is why it is committed behind
+`TURBOVEC_2BIT_VM8=1` (inert by default) rather than discarded. Options
+put to Ryan: (1) opt-in layout, default unchanged; (2) default on,
+accept the nq=1 cost; (3) the pair layout as a compromise (x1.28 /
+x0.88 from the probe). A better nq=1 kernel on vm8 is the open follow-up
+if (2) is chosen: halving the live group set (process each 16-vector
+half straight after its own UZP tree) is the first thing to try.

@@ -1312,7 +1312,22 @@ pub(crate) fn use_vm8() -> bool {
 /// geometry that is a multiple of 4 but not 8 keeps the classic unit.
 #[inline]
 pub(crate) fn vm8_for(bits: usize, n_byte_groups: usize) -> bool {
-    bits == 4 && use_vm8() && n_byte_groups % 8 == 0
+    (bits == 4 && use_vm8() && n_byte_groups % 8 == 0) || vm8_2bit_for(bits, n_byte_groups)
+}
+
+/// H72: whether 2-bit codes take the `vm8` layout for the aarch64 SMMLA
+/// kernel. Opt-in through `TURBOVEC_2BIT_VM8=1` while it is under
+/// measurement; the single-query kernels read the layout through the
+/// `vm8` de-interleave path.
+#[inline]
+pub(crate) fn vm8_2bit_for(bits: usize, n_byte_groups: usize) -> bool {
+    bits == 2 && use_vm8() && n_byte_groups % 8 == 0 && use_vm8_2bit()
+}
+
+#[inline]
+pub(crate) fn use_vm8_2bit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TURBOVEC_2BIT_VM8").is_some_and(|v| v == "1"))
 }
 
 /// Sequential blocked -> `vm8`, in place over whole [`VM8_UNIT`]s.
