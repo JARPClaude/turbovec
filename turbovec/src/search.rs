@@ -121,6 +121,11 @@ fn serial_required(mask_present: bool, simd_ok: bool, force_scalar_any: bool) ->
 /// fork-safe pool, so a single query it calls *serial* must not reach
 /// rayon here either.
 
+/// Queries per batch for the 2-bit VNNI kernel (H56). See the `nq_batch`
+/// selection in the x86 dispatch for the measurement.
+#[cfg(target_arch = "x86_64")]
+const VNNI_BATCH: usize = 6;
+
 #[inline]
 fn n_block_ranges(
     nq: usize,
@@ -4021,11 +4026,20 @@ pub(crate) fn search(
         // The classic BW/AVX2 arms chunk in 4s and the scalar arm loops
         // per query, so 8 remains safe everywhere else.
         let wide_batch_kernel = query_luts.first().is_some_and(|q| q.pd.is_some());
+        // H56: the 2-bit VNNI kernel's per-query cost has its minimum at a
+        // batch of 6 (P36: 0.586 ms/query at N=200k ST against 0.692 at 8
+        // and 0.595 at 4; the same knee L2-resident). Eight was inherited
+        // from the accumulator array's size, not measured. The width is a
+        // const generic (H53), so the tail takes its own instantiation.
+        let vnni_batch_kernel =
+            query_luts.first().is_some_and(|q| q.pd.is_none() && !q.split.is_empty());
         let nq_batch: usize = if wide_batch_kernel
             && rayon::current_num_threads().max(1) == 1
             && nq.div_ceil(10) < nq.div_ceil(8)
         {
             10
+        } else if vnni_batch_kernel {
+            VNNI_BATCH
         } else {
             8
         };

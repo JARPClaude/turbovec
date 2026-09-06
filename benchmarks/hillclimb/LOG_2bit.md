@@ -3379,3 +3379,150 @@ good as the probe's fidelity to the loop's *control* structure, not just
 its instruction mix.
 
 Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
+
+## H55 — VNNI batch width 10 — REFUTED (non-win 1/20)
+
+x86, 2-pass ABBA smoke vs `base2` (min per label): nq100_st 75.292,
+nq100_mt 20.619. Against `h53b`'s soak (67.816 / 17.698) that is
+**x0.90 ST and x0.86 MT** — ten sweeps instead of thirteen and a wider
+amortisation, and the cell got slower. The direction is the information:
+per-query cost *rises* with batch width past 8, so the batch's LUT set
+(60 KB at 10, 48 KB at 8, against a 48 KB L1D) or accumulator pressure is
+already binding at 8, and the sweep-count term is not what limits this
+cell. Reverted. P36 measures per-query cost by width directly before any
+further width change.
+
+**Verdict: non-win 1/20.**
+
+## P36 — per-query ST cost by batch width, on `h53b` (probe; not counted)
+
+x86, `h53b.so`, min of 3 processes per point, k=10:
+
+| nq (one batch) | N=200k ms/query | N=32,768 ms/query |
+|---|---|---|
+| 2 | 0.863 | 0.169 |
+| 3 | 0.652 | 0.134 |
+| 4 | 0.595 | 0.1255 |
+| 5 | 0.597 | 0.1221 |
+| **6** | **0.586** | 0.1223 |
+| 7 | 0.624 | 0.1227 |
+| 8 | 0.692 | 0.1285 |
+| 16 (8+8) | 0.652 | 0.130 |
+| 100 (12x8+4) | 0.696 | 0.134 |
+
+**Width 8 is past the knee at both sizes.** At N=200k the per-query cost
+at 8 is 18% above the minimum at 6; L2-resident it is 5% above. Eight was
+never measured — it is the size of the accumulator array. The shipped cell
+(12 batches of 8 and one of 4) sits at the 8-wide cost; re-batched at 6
+(16 batches of 6 and one of 4) the same table predicts ~59 ms against
+69.6, i.e. ~x1.18 on nq100_st, with MT to be measured (the tile count
+follows the quad count).
+
+Why 8 loses: the `<8>` instantiation carries 34 zmm stack references in
+757 lines against 21 in `<6>` — some are prologue saves, but the
+accumulator file at 8 is 16 zmm plus ~8 temporaries against 32
+registers, and the batch's LUT set is 48 KB against a 48 KB L1D. Both
+ease at 6. This also explains H55: 10 is further past the knee, not a
+different regime.
+
+The memory term is not the story at nq=100: per-vector cost is *lower*
+at 200k than at 32k (3.5 vs 4.1 ns/vector) because the fixed per-query
+work is a larger share of the small index. The lever is the core.
+
+Registered as **H56: `VNNI_BATCH = 6`** for the 2-bit VNNI path, smoked
+against `h53b` first (the climb HEAD is now the H53b build), then against
+`base2` for the authority. Widths 5 and 7 are the natural neighbours if
+6 confirms.
+
+## H56 — `VNNI_BATCH = 6` — smoke
+
+x86, 2-pass ABBA, min per label. Against `base2`: nq100_st 68.679,
+nq100_mt 17.331 (x1.25 / x1.42 on the base2 samples of that run). Directly
+against `h53b`:
+
+```
+h53b  nq100_st 70.197  nq100_mt 18.660
+h56   nq100_st 60.272  nq100_mt 17.511
+h56   nq100_st 70.129  nq100_mt 17.495
+h53b  nq100_st 65.119  nq100_mt 18.243
+```
+
+**nq100_mt x1.042** on the mins, every h56 sample below every h53b sample
+(17.50/17.51 vs 18.24/18.66). **nq100_st is in its bimodal regime** —
+60.3 and 70.1 for the same binary, 65.1 and 70.2 for the other — so the
+smoke's min reads x1.080 but the samples overlap at the slow mode; this is
+exactly the cell P16 diagnosed, and the soak's min-of-9 sub-runs per pass
+exists to reach the fast mode reliably. Promoted: soak vs `base2`
+(authority), a 2-pass soak vs `h53b` (the direct comparison), paired
+sweep, 4-bit observation, `cargo test`.
+
+## H57 / H58 / H59 — PRE-REGISTERED (x86, queued behind the H56 chain)
+
+- **H57 — `VNNI_BATCH = 5`** and **H58 — `VNNI_BATCH = 7`**: P36's
+  neighbours of the minimum (0.597 and 0.624 ms/query against 0.586 at 6).
+  Expected flat-to-worse; run so the width is a measured optimum on the
+  objective cell rather than a probe's, the way H44/H45 swept the unroll.
+- **H59 — prefetch in the batched VNNI kernel** (`PF = true`, the depth-8
+  lookahead the single-query kernel already uses). H4/H5 measured it at
+  ~-5% at nq=100 with the branchy loop, because a re-reading batch evicts
+  what it is about to re-read. The loop is now ~20% faster per byte, so
+  the memory share of the cell is larger and the verdict may not carry.
+  Cheap to re-ask; expected refuted.
+
+Each is smoked against `h56` on the nq=100 cells.
+
+## H56 — soak and authority (sweep, obs4 and cargo test still running)
+
+**Soak vs `base2`** (x86, 3 balanced ABBA passes, min per label;
+`data/r2_h56/`):
+
+| cell | base2 | h56 | |
+|---|---|---|---|
+| nq100_st | 84.465 | 67.284 | **x1.2553** |
+| nq100_mt | 24.029 | 16.328 | **x1.4716** |
+| nq1_st | 1.275 | 1.288 | x0.9897 |
+| nq1_mt | 0.421 | 0.425 | x0.9915 |
+
+**Soak vs `h53b`** (2 balanced ABBA passes, the direct comparison against
+the climb HEAD):
+
+| cell | h53b | h56 | |
+|---|---|---|---|
+| nq100_st | 68.993 | 58.766 | x1.174 (h56 drew the fast mode once; the other three passes 66.5-69.2 against 69.0-69.7) |
+| nq100_mt | 17.943 | 16.878 | **x1.0631** — every h56 pass (16.9-17.3) below every h53b pass (17.9-18.3) |
+| nq1_st | 1.302 | 1.300 | x1.0019 |
+| nq1_mt | 0.423 | 0.422 | x1.0019 |
+
+Parity digests identical to `base2` at both widths.
+
+**Authority, pinned baseline:** x86 4-cell HM x1.2122, **8-cell HM x1.0959,
+worst cell x1.0000 — VERDICT: WIN.**
+
+**Authority, paired in-soak base2:** 8-cell HM x1.0674, worst cell
+**nq1_st_x86 x0.9897 — VERDICT: NOT A WIN** by 0.0003 on the floor.
+Recorded as it printed. That cell is the single-query kernel, which H56
+does not reach (`nq_batch` only shapes batches of more than one query),
+its control band is 8.8% (the round-2 control table), and the direct
+soak against `h53b` reads it at x1.0019. The goal names the pinned
+baseline as the reference and the pinned reading is a WIN by a factor of
+nine over the bar; the paired floor miss is drift on the climb's noisiest
+cell, disclosed rather than argued away. Should the sweep and cargo test
+hold, H56 lands as win #2 on the pinned authority.
+
+## H56 — landed. `whm_2bit.py` VERDICT: WIN — round-2 win #2 (8-cell HM x1.0959)
+
+Remaining gates: paired sweep, 44 points, **none below 0.97** (worst
+nq1_mt x0.993, the single-query kernel); the width change lifts every
+multi-query point — nq=2 x1.29, nq=6 x1.45, nq=12 x1.53, nq=64 x1.21 ST,
+nq=64 MT x1.41 — with no seam at the old batch boundaries (nq=7 x1.10,
+nq=8 x1.18, nq=13 x1.30). `cargo test -p turbovec`: 40 suites green on
+the x86 box and locally. 4-bit observation (`h56_obs4_h56.json`): x86
+nq1_st x1.18 (the bimodal cell), nq1_mt x0.987, nq100_st x0.991,
+nq100_mt x0.988 — the 4-bit path takes the permute-dot kernel and its
+batch width is untouched by `VNNI_BATCH`, so these are drift inside the
+cell bands; recorded, never gated.
+
+Cumulative x86 against the pinned 1.0.0 baseline after two wins:
+nq100_st **x1.255**, nq100_mt **x1.472**; arm unchanged by construction.
+
+Committed on `perf/2bit-hillclimb-2`. **Non-win count: 0/20.**
