@@ -4468,3 +4468,89 @@ accept the nq=1 cost; (3) the pair layout as a compromise (x1.28 /
 x0.88 from the probe). A better nq=1 kernel on vm8 is the open follow-up
 if (2) is chosen: halving the live group set (process each 16-vector
 half straight after its own UZP tree) is the first thing to try.
+
+## Dispositions from existing measurements (non-wins 3, 4, 5 / 20) and H79 — PRE-REGISTERED
+
+Counted, per round 1's convention for candidates a measurement already
+answers:
+
+- **H72 as default (non-win 3/20):** measured above — x1.73 / x1.68 on
+  the arm nq=100 cells against x0.65 / x0.70 at nq=1; fails the
+  no-regression rule. Kept opt-in.
+- **Pair layout (non-win 4/20):** the Axion probe has it at x1.27-1.30
+  for nq=100 and x0.88 at nq=1 (LD2 or UZP); a regression by
+  construction on two cells. Not built.
+- **x86 ST-only prefetch, H63 (non-win 5/20):** H61 measured +4.0% on
+  nq100_st with MT untouched by the gate; one cell at +4% is x1.005 on
+  the 8-cell HM. Not built.
+
+**H79 — four code streams per table load in the x86 nq=1 kernel.** P40
+put both x86 nq=1 cells on L3 bandwidth (30 and 93 GB/s against a DRAM
+tool's 19 and 53), and H34's two-block interleave was the last thing to
+move them. More independent streams per `vpermb` table load is the only
+lever the port count leaves; four blocks is 8 accumulators + 2 tables +
+per-block index pairs, inside the register file. Exact by construction
+(same dpbusd order per accumulator). Queued on x86 behind the capstone,
+smoked against `h69` on nq1_st, nq1_mt with nq100_mt as the control.
+
+## Capstone — the cumulative round-2 build vs the pinned 1.0.0 baseline, one session per box
+
+Both boxes, `base2` vs `h69` (H53+H56+H60+H69; H72 present but inert
+without its toggle), 3 balanced ABBA passes each, min per label, scored
+by `whm_2bit.py` (`data/r2_capstone/`):
+
+```
+cell            arm        x86
+  nq1_st       x0.9948    x1.0232
+  nq1_mt       x1.0408    x1.0488
+  nq100_st     x1.0189    x1.4888
+  nq100_mt     x1.0173    x1.4962
+  arm 4-cell HM  x1.0177
+  x86 4-cell HM  x1.2229
+  8-cell HM      x1.1109   worst cell nq1_st_arm x0.9948
+VERDICT: WIN
+```
+
+Round 2 to date: **8-cell HM x1.111 over 1.0.0**, x86 nq=100 cells
+~x1.49, arm cells x1.02-1.04, no cell below the floor. The capstone
+sweeps (44 paired points per box) are running and will be recorded
+under this entry.
+
+## H79 — four code streams in the x86 nq=1 kernel — REFUTED (non-win 6/20)
+
+x86, 2 rounds vs `h69`: nq1_st 1.296-1.484 vs 1.376-1.410 (x0.94 on
+mins, x1.00 on means — the regime cell), nq1_mt 0.418-0.426 vs
+0.417-0.435 (flat), control nq100_mt x0.98/x0.99 (drift). More streams
+per table load buys nothing: at 30 GB/s from L3 the two-stream kernel
+already keeps enough misses in flight, and the extra index work is not
+free. Reverted. **Verdict: non-win 6/20.**
+
+**Capstone sweep, x86:** 44 paired points, none below 0.97 (min nq1_st
+x1.024); nq=2/4/6/8 ST x1.34/1.26/1.43/1.45, N=200k x1.26 ST / x1.52 MT.
+Arm's sweep to follow.
+
+## H81 / H82 (x86) and H84 / H85 (arm) — constant sweeps at the round-2 geometry — PRE-REGISTERED
+
+Cheap, one build and one smoke each, run as one chain per box:
+
+- **H81** `TILES_PER_THREAD` 32 -> 16 on x86: batch 6 makes 17 quads,
+  so the block axis now splits into 16 ranges (272 tiles); H16 found
+  the constant inert at the old geometry. Cell: nq100_mt.
+- **H82** x86 nq=1 prefetch distance 8 -> 16 quads: the cells are
+  L3-served (P40) rather than DRAM-served as when H21 self-confirmed 8.
+  Cells: nq1_st, nq1_mt.
+- **H84** `TILES_PER_THREAD_NEON` 64 -> 96 on arm: H50's direction
+  (fewer, longer ranges won by 0.33%) at the post-H69 per-block cost.
+  Cells: nq100_mt, nq1_mt.
+- **H85** the 2-bit NEON tile floor `MIN_TILE_BLOCKS_NEON * 2` -> `* 1`
+  (H14's win, re-asked now that the block is cheaper). Cell: nq100_mt.
+
+Expected: flat. Each is a constant round 1 tuned at a geometry that has
+since changed by 20-50%, which is the one honest reason to re-ask.
+
+**Capstone sweep, arm:** 44 paired points; one below 0.97 — **nq13_mt
+x0.953** — the rest x1.01-1.03 (nq=2/4/6/8 ST x1.02/1.01/1.02/1.03,
+N=200k x1.01 ST / x1.02 MT). Nothing in the arm changes (H67's LUT
+build, H68's early exit) is specific to nq=13, and the instrument's
+no-op floor on this box (P4) has 13-23 of 88 points past 3%. Re-measured
+in isolation (P44, six ABBA passes) rather than argued away.
